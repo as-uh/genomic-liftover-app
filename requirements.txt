@@ -1,0 +1,6 @@
+streamlit
+pandas
+numpy
+# Crucially, include CrossMap and its dependency pysam
+pysam
+CrossMap

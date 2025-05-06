@@ -1,0 +1,5 @@
+# For compiling pysam and potentially other dependencies
+build-essential
+zlib1g-dev
+# Add other libraries if CrossMap/pysam installation fails
+# e.g., liblzma-dev, libbz2-dev if needed by htslib/pysam variants
