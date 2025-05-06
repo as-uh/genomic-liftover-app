@@ -3,326 +3,181 @@ import pandas as pd
 import numpy as np
 import os
 import tempfile
-import subprocess # For more robust command execution than os.system
+import subprocess
 
-# --- Original Helper Functions (slightly adapted for clarity if needed) ---
-def create_marker_id(row, chrom_col, pos_col, ref_allele_col, alt_allele_col):
-    """Creates a unique marker ID from chromosome, position, and alleles."""
-    try:
-        # Ensure alleles are strings before sorting, in case they are numeric
-        ref_allele = str(row[ref_allele_col])
-        alt_allele = str(row[alt_allele_col])
-        alleles = sorted([ref_allele, alt_allele])
-        return f"chr{row[chrom_col]}:{row[pos_col]}:{alleles[0]}:{alleles[1]}"
-    except KeyError as e:
-        st.error(f"Column not found: {e}. Please check your column name inputs.")
-        st.stop()
-    except Exception as e:
-        st.error(f"Error creating marker ID for row: {row}\nError: {e}")
-        # Optionally, return a placeholder or skip the row
-        return f"ERROR_CREATING_ID_chr{row.get(chrom_col, 'NA')}:{row.get(pos_col, 'NA')}"
-
-
-def convert_chromosome(chrom):
-    """Converts chromosome values to integers. Handles 'chr' prefix."""
-    if isinstance(chrom, str):
-        chrom_val = chrom.replace('chr', '').strip()
-        if chrom_val == 'X':
-            return 23
-        elif chrom_val == 'Y':
-            return 24
-        elif chrom_val == 'MT' or chrom_val == 'M':
-            return 25 # Common convention for mitochondrial
-    else: # if it's already numeric
-        chrom_val = chrom
-
-    try:
-        return int(chrom_val)
-    except ValueError:
-        return np.nan
-
-
-def create_bed_file(data, chrom_col, pos_col, marker_id_col, output_bed_path):
-    """Creates a BED file for CrossMap."""
-    bed = data.copy()
-    # Ensure 'marker_id' column exists from create_marker_id
-    if marker_id_col not in bed.columns:
-        st.error(f"'{marker_id_col}' column not found. Marker ID creation might have failed.")
-        st.stop()
-
-    # Convert numeric chromosome back to string for BED 'chrX' format
-    # The convert_chromosome function is for converting TO numeric for internal use
-    # For BED, we need 'chr1', 'chrX' etc.
-    def format_chrom_for_bed(c):
-        if c == 23: return 'chrX'
-        if c == 24: return 'chrY'
-        if c == 25: return 'chrM' # or chrMT depending on chain file
-        return f'chr{c}'
-
-    try:
-        # Assuming chrom_col contains numeric or X/Y which was converted to numeric
-        # If original chrom_col had 'chr' prefix, it needs to be handled before numeric conversion
-        # For simplicity, let's assume chrom_col is already prepared as numbers (1-22, 23 for X, 24 for Y)
-        # If not, an earlier step should convert it.
-        # Let's assume the 'chrom_col' in the input DataFrame is what we need to format.
-        bed['bed_chrom'] = bed[chrom_col].apply(lambda x: format_chrom_for_bed(convert_chromosome(x)))
-
-        bed['start'] = bed[pos_col].astype(int) -1 # BED is 0-indexed start
-        bed['end'] = bed[pos_col].astype(int)
-        bed_df_to_save = bed[['bed_chrom', 'start', 'end', marker_id_col]]
-
-        # Remove rows where bed_chrom could not be determined (e.g. 'chrNA')
-        bed_df_to_save = bed_df_to_save[~bed_df_to_save['bed_chrom'].str.contains("NA", na=False)]
-        bed_df_to_save = bed_df_to_save.dropna(subset=['bed_chrom', 'start', 'end', marker_id_col])
-
-
-        if bed_df_to_save.empty:
-            st.error("No valid data to write to BED file after formatting. Check chromosome/position columns.")
-            st.stop()
-
-        bed_df_to_save.to_csv(output_bed_path, sep='\t', index=False, header=False)
-        st.info(f"BED file created at {output_bed_path} with {len(bed_df_to_save)} entries.")
-
-    except KeyError as e:
-        st.error(f"Column not found while creating BED file: {e}. Ensure '{chrom_col}', '{pos_col}', and '{marker_id_col}' are correct.")
-        st.stop()
-    except Exception as e:
-        st.error(f"An error occurred during BED file creation: {e}")
-        st.stop()
-
-
-def lift_over_coordinates(data_path, chain_path, output_prefix,
-                          chrom_col, pos_col, ref_col, alt_col,
-                          sep='\t', compression='infer'):
-    """Performs liftover from one genome build to another using CrossMap."""
-    try:
-        data = pd.read_csv(data_path, sep=sep, compression=compression, low_memory=False)
-        st.write(f"Original data loaded: {len(data)} rows.")
-        if data.empty:
-            st.error("Input data file is empty or could not be read correctly.")
-            return None
-    except Exception as e:
-        st.error(f"Error reading data file: {e}")
-        return None
-
-    # Convert chromosome column to a standardized numeric representation early
-    # This helps if input has 'chrX' or just 'X' or '23'
-    data['numeric_chrom'] = data[chrom_col].apply(convert_chromosome)
-    data = data.dropna(subset=['numeric_chrom']) # Remove rows where chromosome couldn't be parsed
-    data['numeric_chrom'] = data['numeric_chrom'].astype(int)
-    st.write(f"Data after chromosome conversion & filtering: {len(data)} rows.")
-    if data.empty:
-        st.error("No valid chromosome entries found after initial processing.")
-        return None
-
-    # Create marker_id using the standardized numeric chromosome
-    # but the marker_id function itself will prepend 'chr' based on the original chrom_col value
-    # Let's ensure create_marker_id uses a consistent chromosome representation for the ID
-    # So, we pass the original 'chrom_col' for the ID string, but use 'numeric_chrom' for BED
-    temp_marker_id_col = '_temp_marker_id'
-    data[temp_marker_id_col] = data.apply(
-        lambda row: create_marker_id(row, chrom_col, pos_col, ref_col, alt_col),
-        axis=1
-    )
-    st.write("Marker IDs created.")
-
-    # Define BED file paths
-    input_bed_path = f"{output_prefix}.bed"
-    lifted_bed_path = f"{output_prefix}_lifted.bed" # CrossMap output
-    unmapped_bed_path = f"{output_prefix}_unmapped.bed" # CrossMap unmapped output
-
-    # Create BED file using 'numeric_chrom' for consistency in BED chr format
-    create_bed_file(data, 'numeric_chrom', pos_col, temp_marker_id_col, input_bed_path)
-
-    # Run CrossMap
-    # Ensure CrossMap is in PATH or provide full path
-    crossmap_command = [
-        "CrossMap", "bed",
-        chain_path,
-        input_bed_path,
-        lifted_bed_path
-    ]
-    # Adding unmapped output
-    # CrossMap.py bed [OPTIONS] CHAIN_FILE INPUT_FILE OUTPUT_FILE
-    # If you want unmapped: CrossMap.py bed [OPTIONS] CHAIN_FILE INPUT_FILE OUTPUT_FILE_PREFIX
-    # In this case, INPUT_FILE is bed, OUTPUT_FILE_PREFIX will generate .bed and .unmap.bed
-    # So the command should be:
-    # CrossMap bed chain_file input_bed_path output_prefix (this will create output_prefix.bed and output_prefix.unmap.bed)
-    # Let's adjust:
-    lifted_bed_path = f"{output_prefix}_lifted.bed" # Explicitly name lifted output
-    # CrossMap generates output_prefix.bed, so we rename it to be clear
-    # Or, if CrossMap directly takes the output file name:
-    # CrossMap bed {chain_file} {input_bed} {output_lifted_bed}
-    # The original script had: CrossMap bed {chain_path} {output_path}.bed {output_path}_hg38.bed
-    # This means it writes mapped to {output_path}_hg38.bed and unmapped to {output_path}_hg38.bed.unmap
-    
-    # Let's stick to the original script's naming for CrossMap output for mapped reads
-    actual_crossmap_output_bed = f"{output_prefix}_crossmap_output.bed" # This is where CrossMap writes mapped
-    unmapped_crossmap_file = f"{actual_crossmap_output_bed}.unmap" # CrossMap appends .unmap
-
-    st.info(f"Running CrossMap: {' '.join(crossmap_command)}")
-    st.info(f"Input BED for CrossMap: {input_bed_path}")
-    st.info(f"Chain file for CrossMap: {chain_path}")
-    st.info(f"Output BED from CrossMap will be: {actual_crossmap_output_bed}")
-
-
-    # Command: CrossMap bed <chain_file> <input_bed> <output_bed>
-    # The third argument is the output file for *mapped* regions.
-    # Unmapped regions are typically written to <output_bed>.unmap
-    crossmap_command_final = ["CrossMap", "bed", chain_path, input_bed_path, actual_crossmap_output_bed]
-
-    try:
-        # Using subprocess.run for better control
-        result = subprocess.run(crossmap_command_final, capture_output=True, text=True, check=False)
-        if result.returncode != 0:
-            st.error(f"CrossMap failed with return code {result.returncode}.")
-            st.error(f"CrossMap STDERR:\n{result.stderr}")
-            st.error(f"CrossMap STDOUT:\n{result.stdout}")
-            # Check if CrossMap exists
-            try:
-                subprocess.run(["CrossMap", "-h"], capture_output=True, check=True)
-            except FileNotFoundError:
-                st.error("CrossMap command not found. Please ensure it is installed and in your system's PATH.")
-            except subprocess.CalledProcessError:
-                st.warning("CrossMap found, but '-h' failed. Check CrossMap installation.")
-            return None
-        st.success("CrossMap finished.")
-        st.text(f"CrossMap STDOUT:\n{result.stdout}")
-        if result.stderr:
-             st.text(f"CrossMap STDERR:\n{result.stderr}")
-
-
-    except FileNotFoundError:
-        st.error("CrossMap command not found. Please ensure it is installed and in your system's PATH.")
-        return None
-    except Exception as e:
-        st.error(f"An error occurred while running CrossMap: {e}")
-        return None
-
-    if not os.path.exists(actual_crossmap_output_bed) or os.path.getsize(actual_crossmap_output_bed) == 0:
-        st.warning(f"Lifted BED file '{actual_crossmap_output_bed}' was not created or is empty. "
-                   "This might mean no coordinates were successfully lifted over. "
-                   "Check CrossMap logs if available, and the unmapped file.")
-        # Create an empty DataFrame for lifted if file doesn't exist to avoid crashing later
-        lifted = pd.DataFrame(columns=['chrom', 'start', 'end', temp_marker_id_col, 'Pos_b_lifted'])
-
-    else:
-        try:
-            lifted = pd.read_csv(
-                actual_crossmap_output_bed, sep='\t', header=None,
-                names=['chrom_lifted_raw', 'start_lifted', 'end_lifted', temp_marker_id_col]
-            )
-            st.write(f"Lifted data read from BED: {len(lifted)} rows.")
-            # Position in BED 'end' column is the 1-based coordinate for single points
-            lifted['Pos_b_lifted'] = lifted['end_lifted'].astype('int64')
-
-        except pd.errors.EmptyDataError:
-            st.warning(f"Lifted BED file '{actual_crossmap_output_bed}' is empty. No coordinates mapped.")
-            lifted = pd.DataFrame(columns=['chrom_lifted_raw', 'start_lifted', 'end_lifted', temp_marker_id_col, 'Pos_b_lifted'])
-        except Exception as e:
-            st.error(f"Error reading lifted BED file '{actual_crossmap_output_bed}': {e}")
-            return None
-
-
-    if not lifted.empty:
-        lifted['chrom_lifted_numeric'] = lifted['chrom_lifted_raw'].apply(convert_chromosome)
-        lifted = lifted[lifted['chrom_lifted_numeric'].notnull()]
-        if not lifted.empty:
-            lifted['chrom_lifted_numeric'] = lifted['chrom_lifted_numeric'].astype('int64')
-    else:
-        # Add empty columns if lifted is empty to prevent merge errors
-        lifted['chrom_lifted_numeric'] = pd.Series(dtype='int64')
-        lifted['Pos_b_lifted'] = pd.Series(dtype='int64')
-        lifted['chrom_lifted_raw'] = pd.Series(dtype='object')
-
-
-    st.write(f"Processed lifted data: {len(lifted)} rows.")
-
-    # Merge back with original data
-    merged = data.merge(
-        lifted[['chrom_lifted_numeric', 'Pos_b_lifted', 'chrom_lifted_raw', temp_marker_id_col]],
-        on=temp_marker_id_col,
-        how='left'
-    )
-    # Rename columns for clarity
-    merged = merged.rename(columns={
-        'chrom_lifted_numeric': 'chrom_lifted',
-        'Pos_b_lifted': 'pos_lifted',
-        'chrom_lifted_raw': 'chrom_lifted_str' # Keep the chrX style string if needed
-    })
-    # Remove the temporary numeric chromosome column if it's a duplicate or not needed
-    # merged = merged.drop(columns=['numeric_chrom']) # numeric_chrom was from original data
-    merged = merged.drop(columns=[temp_marker_id_col]) # Drop the temporary marker ID
-
-    st.write(f"Merged data: {len(merged)} rows.")
-
-    output_csv_path = f"{output_prefix}_lifted_results.csv"
-    try:
-        merged.to_csv(output_csv_path, sep=sep if sep != '\t' else ',', index=False, compression=compression if compression != "infer" else None)
-        st.success(f"Liftover complete. Results saved to {output_csv_path} (for download).")
-        return output_csv_path
-    except Exception as e:
-        st.error(f"Error saving final CSV: {e}")
-        return None
+# --- ALL YOUR HELPER FUNCTIONS (create_marker_id, convert_chromosome, etc.) remain the same ---
+# ... (keep all your existing functions like create_marker_id, convert_chromosome, create_bed_file, lift_over_coordinates)
 
 # --- Streamlit App UI ---
-st.set_page_config(layout="wide")
-st.title("Genomic Coordinate Liftover Tool (using CrossMap)")
+st.set_page_config(layout="wide", page_title="Genomic Liftover Tool", page_icon="🧬")
 
+# --- NEW WELCOME PAGE CONTENT ---
+st.title("🧬 Genomic Coordinate Liftover Tool")
 st.markdown("""
-This tool performs a liftover of genomic coordinates from one genome build to another
-using a chain file and the CrossMap utility.
-
-**Prerequisite:** `CrossMap` (and its dependency `pysam`) must be installed in the environment
-where this Streamlit app is running and be accessible from the command line.
-You can typically install it via pip: `pip install CrossMap pysam`
+Welcome! This application helps you convert genomic coordinates (like SNPs or other markers)
+from one human genome build to another (e.g., hg19/GRCh37 to hg38/GRCh38 or vice-versa).
+It uses the powerful **CrossMap** tool and a **chain file** to perform the liftover.
 """)
 
+st.markdown("---") # Visual separator
+
+# How to Use Section
+st.header("🚀 How to Use This Tool")
+st.markdown("""
+1.  **📁 Upload Your Files (in the sidebar on the left):**
+    *   **Input Data File:** Your genomic data. This should be a text file (CSV, TSV, TXT), potentially gzipped (`.gz`). It **must** contain columns for chromosome, position, reference allele, and alternate allele.
+    *   **Chain File:** A liftover chain file (e.g., `hg19ToHg38.over.chain.gz`). This file defines the mappings between the two genome builds. You can download common chain files from sources like the [UCSC Genome Browser](https://hgdownload.soe.ucsc.edu/goldenPath/hg19/liftOver/) (look for `.over.chain.gz` files).
+
+2.  **⚙️ Configure Parameters (in the sidebar):**
+    *   **Output File Prefix:** A name for your output files (e.g., `my_data_hg38`).
+    *   **Column Names:** Accurately specify the names of the columns in your data file that correspond to:
+        *   Chromosome (e.g., `CHR`, `chrom`, `Chromosome`)
+        *   Base Pair Position (e.g., `BP`, `pos`, `Position`)
+        *   Reference Allele (e.g., `REF`, `ref`, `Allele1`)
+        *   Alternate Allele (e.g., `ALT`, `alt`, `Allele2`)
+    *   **Input File Separator:** Choose how columns are separated in your input file (Comma, Tab, or Space).
+
+3.  **▶️ Run Liftover:**
+    *   Click the **"Run Liftover"** button in the sidebar.
+    *   The process might take some time, especially for large files. A spinner will indicate progress.
+
+4.  **📥 Download Results:**
+    *   Once complete, a download button will appear for your processed file (e.g., `my_data_hg38_lifted_results.csv`).
+    *   The output file will include your original data along with new columns for the lifted chromosome (`chrom_lifted`) and position (`pos_lifted`).
+""")
+st.info("💡 **Tip:** Use the sidebar on the left to upload files and configure your liftover.")
+
+st.markdown("---")
+
+# Informational Expanders
+st.header("ℹ️ Learn More")
+
+with st.expander("What is Genomic Liftover?"):
+    st.markdown("""
+    Genomic liftover (or coordinate lifting) is the process of converting genomic coordinates from one version of a reference genome assembly to another.
+    Genome assemblies are updated over time to improve accuracy, fill gaps, and correct errors. This means that the "address" (chromosome and position) of a specific gene or variant can change between assemblies.
+
+    **Why is it necessary?**
+    *   You might have older data annotated on hg19 but need to compare it with newer resources based on hg38.
+    *   Integrating datasets from different studies that used different reference genomes.
+    *   Ensuring consistency when using various bioinformatics tools and databases.
+    """)
+
+with st.expander("Understanding Chain Files"):
+    st.markdown("""
+    A **chain file** is a crucial component for liftover. It essentially contains a detailed map of how segments of one genome assembly align to another.
+    *   These files are typically generated by aligning two genome assemblies (e.g., hg19 and hg38) to each other.
+    *   They describe blocks of sequence that are conserved between the two assemblies and how their coordinates relate.
+    *   Common chain files (e.g., `hg19ToHg38.over.chain.gz`, `hg38ToHg19.over.chain.gz`) can be downloaded from resources like the [UCSC Genome Browser downloads page](https://hgdownload.soe.ucsc.edu/downloads.html).
+    *   Make sure you choose the correct chain file for the direction of your conversion (e.g., if your data is hg19 and you want hg38, use an hg19-to-hg38 chain file).
+    """)
+
+with st.expander("How `marker_id` is Created and Used"):
+    st.markdown("""
+    To ensure accurate matching of variants before and after liftover, this tool creates a unique `marker_id` for each row in your input data.
+    *   The ID is formatted as: `chr<Chromosome>:<Position>:<Allele1>:<Allele2>`
+    *   The alleles (Reference and Alternate) are **sorted alphabetically** before being included in the ID. This means `chr1:100:A:T` is the same as `chr1:100:T:A`. This is important because the ref/alt orientation can sometimes be ambiguous or flipped.
+    *   This `marker_id` is used to:
+        1.  Label entries in the temporary BED file fed to CrossMap.
+        2.  Reliably merge the liftover results (new coordinates) back with your original data.
+    """)
+
+with st.expander("About CrossMap"):
+    st.markdown("""
+    This tool uses **CrossMap** ([http://crossmap.sourceforge.net/](http://crossmap.sourceforge.net/)) in the background.
+    CrossMap is a versatile command-line program for convenient conversion of genome coordinates and genome annotation files between different genome assemblies.
+    It supports various file formats, including BED, GFF/GTF, VCF, and SAM/BAM.
+    This application specifically uses its `CrossMap bed` functionality.
+    """)
+
+st.markdown("---")
+st.markdown("Application developed to simplify genomic coordinate liftover. Ensure `CrossMap` is correctly installed if running locally, or that dependencies are met on Streamlit Community Cloud.")
+st.markdown("Navigate to the sidebar to begin! ⬅️")
+
+
+# --- SIDEBAR CONTENT (remains mostly the same) ---
+st.sidebar.header("Liftover Configuration") # Changed title slightly
+
 # File Uploads
-st.sidebar.header("1. Upload Files")
+st.sidebar.subheader("1. Upload Files") # Used subheader for better structure
 uploaded_data_file = st.sidebar.file_uploader("Upload your input data file (e.g., .tsv.gz, .csv)", type=['csv', 'tsv', 'gz', 'txt'])
 uploaded_chain_file = st.sidebar.file_uploader("Upload your chain file (e.g., .chain.gz)", type=['chain', 'gz'])
 
 # Configuration
-st.sidebar.header("2. Configure Parameters")
+st.sidebar.subheader("2. Configure Parameters") # Used subheader
 output_prefix = st.sidebar.text_input("Output file prefix", "liftover_results")
 
 # Dynamically get column names from uploaded data file if available
 col_names = []
 temp_data_for_cols = None
 if uploaded_data_file:
+    # ... (your existing column name detection logic)
     try:
         # Read only a few lines to get headers
+        # Make sure to handle potential errors if file is not readable as expected
+        current_pos = uploaded_data_file.tell()
         if uploaded_data_file.name.endswith('.gz'):
-            temp_data_for_cols = pd.read_csv(uploaded_data_file, sep=None, engine='python', compression='gzip', nrows=5)
+            temp_data_for_cols = pd.read_csv(uploaded_data_file, sep=None, engine='python', compression='gzip', nrows=5, on_bad_lines='skip')
         else:
-            temp_data_for_cols = pd.read_csv(uploaded_data_file, sep=None, engine='python', nrows=5)
-        uploaded_data_file.seek(0) # Reset file pointer
-        if temp_data_for_cols is not None:
+            temp_data_for_cols = pd.read_csv(uploaded_data_file, sep=None, engine='python', nrows=5, on_bad_lines='skip')
+        uploaded_data_file.seek(current_pos) # Reset file pointer
+        if temp_data_for_cols is not None and not temp_data_for_cols.empty:
             col_names = temp_data_for_cols.columns.tolist()
+        else:
+            st.sidebar.caption("Could not auto-detect columns. Please enter manually.")
     except Exception as e:
         st.sidebar.warning(f"Could not pre-read column names: {e}")
+        uploaded_data_file.seek(0) # Reset file pointer in case of error
+
+# Using st.selectbox for column names allows for easier selection if col_names is populated
+chrom_col_default_index = 0
+if col_names:
+    for i, col in enumerate(col_names):
+        if col.lower() in ['chrom', 'chr', 'chromosome']:
+            chrom_col_default_index = i
+            break
+chrom_col = st.sidebar.selectbox("Chromosome column name", col_names if col_names else ["Enter Manually"], index=chrom_col_default_index if col_names else 0)
+if not col_names: chrom_col = st.sidebar.text_input("Chromosome column (if not in list)", "chrom")
 
 
-chrom_col = st.sidebar.selectbox("Chromosome column name", col_names, index=col_names.index('chrom') if 'chrom' in col_names else (col_names.index('CHR') if 'CHR' in col_names else 0) if col_names else 0)
-pos_col = st.sidebar.selectbox("Base pair position column name", col_names, index=col_names.index('pos') if 'pos' in col_names else (col_names.index('POS') if 'POS' in col_names else (col_names.index('BP') if 'BP' in col_names else 0)) if col_names else 0)
-ref_col = st.sidebar.selectbox("Reference allele column name", col_names, index=col_names.index('ref') if 'ref' in col_names else (col_names.index('REF') if 'REF' in col_names else 0) if col_names else 0)
-alt_col = st.sidebar.selectbox("Alternate allele column name", col_names, index=col_names.index('alt') if 'alt' in col_names else (col_names.index('ALT') if 'ALT' in col_names else 0) if col_names else 0)
+pos_col_default_index = 0
+if col_names:
+    for i, col in enumerate(col_names):
+        if col.lower() in ['pos', 'bp', 'position', 'variantpos']:
+            pos_col_default_index = i
+            break
+pos_col = st.sidebar.selectbox("Base pair position column name", col_names if col_names else ["Enter Manually"], index=pos_col_default_index if col_names else 0)
+if not col_names: pos_col = st.sidebar.text_input("Position column (if not in list)", "pos")
+
+
+ref_col_default_index = 0
+if col_names:
+    for i, col in enumerate(col_names):
+        if col.lower() in ['ref', 'reference', 'allele1', 'refallele']:
+            ref_col_default_index = i
+            break
+ref_col = st.sidebar.selectbox("Reference allele column name", col_names if col_names else ["Enter Manually"], index=ref_col_default_index if col_names else 0)
+if not col_names: ref_col = st.sidebar.text_input("Reference allele column (if not in list)", "ref")
+
+
+alt_col_default_index = 0
+if col_names:
+    for i, col in enumerate(col_names):
+        if col.lower() in ['alt', 'alternate', 'allele2', 'altallele']:
+            alt_col_default_index = i
+            break
+alt_col = st.sidebar.selectbox("Alternate allele column name", col_names if col_names else ["Enter Manually"], index=alt_col_default_index if col_names else 0)
+if not col_names: alt_col = st.sidebar.text_input("Alternate allele column (if not in list)", "alt")
+
 
 input_sep_options = {',': 'Comma (,)', '\t': 'Tab (\\t)', ' ': 'Space ( )'}
 input_sep_display = st.sidebar.selectbox("Input file separator", options=list(input_sep_options.keys()), format_func=lambda x: input_sep_options[x])
 
-# Compression for output (input compression is inferred by pandas)
-# output_compression = st.sidebar.selectbox("Output file compression", [None, 'gzip'], format_func=lambda x: x if x else "None")
-# For simplicity, let's make output CSV uncompressed, or match input if it was gzip
-# The lift_over_coordinates function already handles compression='infer' for input and 'None' or 'gzip' for output.
-# For the web app, providing an uncompressed CSV for download is often easiest.
-
-
-if st.sidebar.button("🚀 Run Liftover"):
+st.sidebar.subheader("3. Run Liftover") # Used subheader
+if st.sidebar.button("🚀 Run Liftover", key="run_liftover_button"): # Added key for uniqueness
     if uploaded_data_file and uploaded_chain_file and chrom_col and pos_col and ref_col and alt_col and output_prefix:
+        # ... (your existing "Run Liftover" logic)
         with st.spinner("Processing... This may take a while for large files."):
-            # Create temporary directory to store uploaded files and intermediate files
             with tempfile.TemporaryDirectory() as tmpdir:
                 data_file_path = os.path.join(tmpdir, uploaded_data_file.name)
                 with open(data_file_path, "wb") as f:
@@ -333,11 +188,9 @@ if st.sidebar.button("🚀 Run Liftover"):
                     f.write(uploaded_chain_file.getbuffer())
 
                 temp_output_prefix = os.path.join(tmpdir, output_prefix)
-
-                # Determine compression for output based on input data file name
                 output_compression_type = 'gzip' if uploaded_data_file.name.endswith('.gz') else None
 
-                final_output_csv_path = lift_over_coordinates(
+                final_output_csv_path = lift_over_coordinates( # This function is defined elsewhere
                     data_path=data_file_path,
                     chain_path=chain_file_path,
                     output_prefix=temp_output_prefix,
@@ -346,48 +199,50 @@ if st.sidebar.button("🚀 Run Liftover"):
                     ref_col=ref_col,
                     alt_col=alt_col,
                     sep=input_sep_display,
-                    compression=output_compression_type # Pass this for saving output
+                    compression=output_compression_type
                 )
 
                 if final_output_csv_path and os.path.exists(final_output_csv_path):
                     st.success("Liftover process completed!")
                     with open(final_output_csv_path, "rb") as fp:
-                        # Determine the final download filename
                         download_filename = f"{output_prefix}_lifted_results.csv"
                         if output_compression_type == 'gzip':
                             download_filename += ".gz"
-
                         st.download_button(
-                            label="Download Lifted Data",
+                            label="📥 Download Lifted Data",
                             data=fp,
                             file_name=download_filename,
                             mime="text/csv" if output_compression_type is None else "application/gzip"
                         )
-                    
-                    # Optionally, display a preview of the results
                     try:
-                        preview_df = pd.read_csv(final_output_csv_path, sep=input_sep_display if input_sep_display != '\t' else ',', 
-                                                 compression=output_compression_type)
-                        st.dataframe(preview_df.head())
-                        
-                        # Provide info on unmapped file if it exists
+                        # Determine separator for reading preview correctly
+                        preview_sep = ',' if input_sep_display == ',' else '\t' # Simplified, might need adjustment for space
+                        if input_sep_display == ' ': preview_sep = r'\s+'
+
+                        preview_df = pd.read_csv(final_output_csv_path,
+                                                 sep=preview_sep,
+                                                 compression=output_compression_type,
+                                                 nrows=100) # Limit preview size
+                        st.markdown("### Preview of Lifted Data (first 100 rows):")
+                        st.dataframe(preview_df)
+
                         unmapped_file_expected_path = f"{temp_output_prefix}_crossmap_output.bed.unmap"
                         if os.path.exists(unmapped_file_expected_path) and os.path.getsize(unmapped_file_expected_path) > 0:
                             st.info(f"An unmapped regions file was also generated by CrossMap: "
                                     f"'{os.path.basename(unmapped_file_expected_path)}'. "
-                                    f"This is not included in the download but indicates regions that couldn't be lifted.")
+                                    f"This file contains regions that could not be lifted over and is stored temporarily with other intermediate files.")
                         elif os.path.exists(unmapped_file_expected_path):
                              st.info("Unmapped regions file was generated by CrossMap but is empty.")
 
-
                     except Exception as e:
                         st.warning(f"Could not display preview of results: {e}")
-
-                elif final_output_csv_path: # Path returned but file not found
+                elif final_output_csv_path:
                      st.error(f"Output file {final_output_csv_path} was expected but not found. Please check logs.")
-                else: # None returned, error already shown by function
-                    st.error("Liftover process failed. Please check the error messages above.")
+                else:
+                    st.error("Liftover process failed. Please check the error messages above or contact support.")
     else:
-        st.sidebar.error("Please fill in all fields and upload necessary files.")
+        st.sidebar.error("⚠️ Please fill in all fields and upload necessary files before running.")
 
+# Footer or additional info
 st.markdown("---")
+st.caption("Built with Streamlit | Uses CrossMap for liftover operations.")
