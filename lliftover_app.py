@@ -246,8 +246,7 @@ if st.sidebar.button("🚀 Run Liftover", key="run_liftover_button"): # Added ke
 # Footer or additional info
 st.markdown("---")
 st.caption("Built with Streamlit | Uses CrossMap for liftover operations.")
-
-st.markdown("by Alok Singh - 2025")
+st.caption("by Alok Singh - 2025")
 
 st.markdown("If you encounter any issues, please report them on the GitHub repository. https://github.com/as-uh/genomic-liftover-app.git")
 st.markdown("**Disclaimer:** This tool is provided as-is. Ensure you have the necessary permissions to use the data and tools.")
