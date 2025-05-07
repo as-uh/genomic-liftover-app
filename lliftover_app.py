@@ -252,6 +252,5 @@ st.markdown("If you encounter any issues, please report them on the GitHub repos
 st.markdown("**Disclaimer:** This tool is provided as-is. Ensure you have the necessary permissions to use the data and tools.")
 st.markdown("**Note:** This app is designed for educational and research purposes. "
              "Always validate results with appropriate bioinformatics pipelines.")
-```
+
 # End of the Streamlit app code
-```
