@@ -391,3 +391,12 @@ if st.sidebar.button("🚀 Run Liftover"):
         st.sidebar.error("Please fill in all fields and upload necessary files.")
 
 st.markdown("---")
+st.markdown("by Alok Singh - 2025")
+
+st.markdown("If you encounter any issues, please report them on the GitHub repository. https://github.com/as-uh/genomic-liftover-app.git")
+st.markdown("**Disclaimer:** This tool is provided as-is. Ensure you have the necessary permissions to use the data and tools.")
+st.markdown("**Note:** This app is designed for educational and research purposes. "
+             "Always validate results with appropriate bioinformatics pipelines.")
+```
+# End of the Streamlit app code
+```
